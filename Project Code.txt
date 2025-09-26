@@ -1,0 +1,691 @@
+#include "esp_http_server.h"
+#include "esp_timer.h"
+#include "esp_camera.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "esp32-hal-ledc.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <WiFi.h>
+#include "DHT.h"                // <-- DHT library for DHT22
+
+#define CAMERA_MODEL_AI_THINKER
+
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* Wifi Crdentials */
+const char* ssid = "Aakash";
+const char* password = "aakash7405";
+
+/* Defining DC motor, Servo and Flash LED pins */
+const int RMotor1 = 14;
+const int RMotor2 = 15;
+const int LMotor1 = 13;
+const int LMotor2 = 12;
+const int panServo = 2;
+const int tiltServo = 3;
+const int FlashPin = 4;
+
+/* Sensor pins (change if you wired differently) */
+const int MQ2_PIN = 33;       // ADC pin for MQ2 (analog)
+const int SOUND_DIGITAL = 17; // Digital output from LM393 (HIGH = sound detected)
+const int DHTPIN = 16;        // DHT22 data pin
+#define DHTTYPE DHT22
+
+DHT dht(DHTPIN, DHTTYPE);
+
+/* Defining initial values */
+int speed = 255;
+int panVal = 4875;
+int tiltVal = 4875;
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t stream_httpd = NULL;
+httpd_handle_t camera_httpd = NULL;
+
+/* Stream handler (unchanged) */
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t * _jpg_buf = NULL;
+  char part_buf[64];
+
+  static int64_t last_frame = 0;
+  if (!last_frame) {
+    last_frame = esp_timer_get_time();
+  }
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) {
+    return res;
+  }
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      if (fb->format != PIXFORMAT_JPEG) {
+        bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        if (!jpeg_converted) {
+          Serial.println("JPEG compression failed");
+          res = ESP_FAIL;
+        }
+      } else {
+        _jpg_buf_len = fb->len;
+        _jpg_buf = fb->buf;
+      }
+    }
+    if (res == ESP_OK) {
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL;
+    } else if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    if (res != ESP_OK) {
+      break;
+    }
+    int64_t fr_end = esp_timer_get_time();
+    int64_t frame_time = fr_end - last_frame;
+    last_frame = fr_end;
+    frame_time /= 1000;
+    // Serial.printf("MJPG: %uB %ums (%.1ffps)\n", (uint32_t)(_jpg_buf_len), (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time);
+  }
+
+  last_frame = 0;
+  return res;
+}
+
+/* Command handler (unchanged) */
+static esp_err_t cmd_handler(httpd_req_t *req) {
+  char*  buf;
+  size_t buf_len;
+  char variable[32] = {0,};
+  char value[32] = {0,};
+
+  buf_len = httpd_req_get_url_query_len(req) + 1;
+  if (buf_len > 1) {
+    buf = (char*)malloc(buf_len);
+    if (!buf) {
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+      if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK &&
+          httpd_query_key_value(buf, "val", value, sizeof(value)) == ESP_OK) {
+      } else {
+        free(buf);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+      }
+    } else {
+      free(buf);
+      httpd_resp_send_404(req);
+      return ESP_FAIL;
+    }
+    free(buf);
+  } else {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  int val = atoi(value);
+  sensor_t * s = esp_camera_sensor_get();
+  int res = 0;
+
+  /* Flash LED control */
+  if (!strcmp(variable, "flash"))
+  {
+    ledcWrite(3, val);
+  }
+  else if (!strcmp(variable, "speed"))
+  {
+    /* Setting the motor speed */
+    if      (val > 255) val = 255;
+    else if (val <   0) val = 0;
+    speed = val;
+  }
+  /* Robot direction control */
+  else if (!strcmp(variable, "car")) {
+    if (val == 1) {
+      Serial.println("Forward");
+      ledcWrite(4, speed);
+      ledcWrite(5, 0);
+      ledcWrite(6, 0);
+      ledcWrite(7, speed);
+    }
+    else if (val == 2) {
+      Serial.println("Turn Left");
+      ledcWrite(4, speed);
+      ledcWrite(5, 0);
+      ledcWrite(6, speed);
+      ledcWrite(7, 0);
+    }
+    else if (val == 3) {
+      Serial.println("Stop");
+      ledcWrite(4, 0);
+      ledcWrite(5, 0);
+      ledcWrite(6, 0);
+      ledcWrite(7, 0);
+    }
+    else if (val == 4) {
+      Serial.println("Turn Right");
+      ledcWrite(4, 0);
+      ledcWrite(5, speed);
+      ledcWrite(6, 0);
+      ledcWrite(7, speed);
+     }
+    else if (val == 5) {
+      Serial.println("Backward");
+      ledcWrite(4, 0);
+      ledcWrite(5, speed);
+      ledcWrite(6, speed);
+      ledcWrite(7, 0);
+    }
+  }
+  /* Pan and Tilt servo control */
+  else if (!strcmp(variable, "pantilt")) {
+    if (val == 1) {
+      Serial.println("Tilt Up");
+      if      (tiltVal > 6500) tiltVal = 6500;
+      else if (tiltVal < 3250) tiltVal = 3250;
+      tiltVal = tiltVal + 200;
+      ledcWrite(9, tiltVal);
+    }
+    else if (val == 2) {
+      Serial.println("Pan Left");
+      if      (panVal > 6500) panVal = 6500;
+      else if (panVal < 3250) panVal = 3250;
+      panVal = panVal + 200;
+      ledcWrite(8, panVal);
+    }
+    else if (val == 3) {
+      Serial.println("Pan Right");
+      if      (panVal > 6500) panVal = 6500;
+      else if (panVal < 3250) panVal = 3250;
+      panVal = panVal - 200;
+      ledcWrite(8, panVal);
+    }
+    else if (val == 4) {
+      Serial.println("Tilt Down");
+      if      (tiltVal > 6500) tiltVal = 6500;
+      else if (tiltVal < 3250) tiltVal = 3250;
+      tiltVal = tiltVal - 200;
+      ledcWrite(9, tiltVal);
+    }
+  }
+  else
+  {
+    Serial.println("variable");
+    res = -1;
+  }
+
+  if (res) {
+    return httpd_resp_send_500(req);
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, NULL, 0);
+}
+
+/* Status handler (unchanged) */
+static esp_err_t status_handler(httpd_req_t *req) {
+  static char json_response[1024];
+
+  sensor_t * s = esp_camera_sensor_get();
+  char * p = json_response;
+  *p++ = '{';
+
+  p += sprintf(p, "\"framesize\":%u,", s->status.framesize);
+  p += sprintf(p, "\"quality\":%u,", s->status.quality);
+  *p++ = '}';
+  *p++ = 0;
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json_response, strlen(json_response));
+}
+
+/* NEW: Sensor data handler
+   Returns JSON:
+   { "temperature": <float>, "humidity": <float>, "mq2": <int>, "sound": <int> }
+*/
+static esp_err_t sensor_data_handler(httpd_req_t *req) {
+  static char json_response[256];
+
+  // Read DHT22
+  float temperature = dht.readTemperature(); // Celsius
+  float humidity    = dht.readHumidity();
+
+  if (isnan(temperature)) {
+    temperature = -999.0; // error sentinel
+  }
+  if (isnan(humidity)) {
+    humidity = -999.0;
+  }
+
+  // Read MQ2 (analog)
+  int mq2_raw = analogRead(MQ2_PIN); // 0 - 4095
+  // Optionally map to 0-1023: int mq2_mapped = map(mq2_raw, 0, 4095, 0, 1023);
+
+  // Read LM393 (digital) - 1 if sound detected, 0 otherwise
+  int sound_detect = digitalRead(SOUND_DIGITAL);
+
+  // Build JSON
+  int len = snprintf(json_response, sizeof(json_response),
+    "{\"temperature\":%.1f,\"humidity\":%.1f,\"mq2\":%d,\"sound\":%d}",
+    temperature, humidity, mq2_raw, sound_detect);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json_response, len);
+}
+
+/* Index HTML page design (unchanged) */
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Summer Project - Login and Rover Control</title>
+    <style>
+        body {
+                        background: linear-gradient(135deg, #07101c, #212df0);
+                         display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .hidden {
+            display: none;
+        }
+        .login-container, #main-content {
+            background-color: #2c3e50;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+            color: white;
+        }
+        .login-container input, .login-container button {
+            width: 90%;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+         }
+        .login-container button {
+            background-color: #2ecc71;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        .login-container button:hover {
+            background-color: #27ae60;
+        }
+        #main-content { background: linear-gradient(155deg, #07101c, #8148d3);
+             width: 100%;
+            height: 100%;
+            display: none;
+        }
+        section, #home {
+            display: none; /* Hide sections and home by default */
+        }
+        section.active, #home.active {
+            display: block; /* Show the active section or home */
+        }
+        button { background:  #1d80bd;
+            padding: 15px;
+            margin: 8px;
+        }
+    </style>
+</head>
+<body  >
+    <!-- Login Page -->
+    <div class="login-container" id="login-page"; >
+        <h2>Summer Project</h2>
+        <h3>Login ID</h3>
+        <form onsubmit="return validateLogin(event)">
+            <input type="text" id="username" placeholder="Username" required>
+            <input type="password" id="password" placeholder="Password" required>
+            <br><br>
+            <button type="submit">LOGIN</button>
+        </form>
+    </div>
+
+    <!-- Main Content (Hidden initially) -->
+    <div id="main-content">
+        <div id="home" class="active">
+            <h1>Summer Project</h1>
+            <p>Pre-rescuer cam rover with smart weather monitoring</p>
+            <nav>
+                <div style="text-align: center;"> <br><br><br><br><br>
+ <div style="width: 350px; height: 70px; background-color: #b9d545; border: 2px solid black; border-radius: 15px;text-aling: center">
+                    <button><a href="#" onclick="showSection('section1')">Rover Control</a></button>
+                    <button><a href="#" onclick="showSection('section2')">Sensor Value Display</a></button> </div>
+                </div>
+            </nav>
+        </div>
+
+        <!-- Section 1 - Rover Control -->
+        <section id="section1">
+              <div align=center> <img id= "camstream" src="" style='width:300px;'></div>
+    <br/>
+    <br/>
+    <div align=center>
+     <button class="button" id="forward" ontouchstart="fetch(document.location.origin+'/control?var=car&val=1');" ontouchend="fetch(document.location.origin+'/control?var=car&val=3');" >Forward</button>
+    </div>
+    <br/>
+    <div align=center>
+     <button class="button" id="turnleft" ontouchstart="fetch(document.location.origin+'/control?var=car&val=2');" ontouchend="fetch(document.location.origin+'/control?var=car&val=3');" >Turn Left</button>
+    <button class="button" id="stop" onclick="fetch(document.location.origin+'/control?var=car&val=3');">Stop</button>
+    <button class="button" id="turnright" ontouchstart="fetch(document.location.origin+'/control?var=car&val=4');" ontouchend="fetch(document.location.origin+'/control?var=car&val=3');" >Turn Right</button>
+    </div>
+    <br/>
+
+     <div align=center>
+     <button class="button" id="backward" ontouchstart="fetch(document.location.origin+'/control?var=car&val=5');" ontouchend="fetch(document.location.origin+'/control?var=car&val=3');">Backward</button>
+    </div>
+    <br/>
+    <div align=center>
+     <label class="label">Flash</label>
+    <input type="range" class="slider" id="flash" min="0" max="255" value="0" onchange="try{fetch(document.location.origin+'/control?var=flash&val='+this.value);}catch(e){}">
+    </div>
+    <br/>
+    <div align=center>
+     <label class="label">Speed</label>
+    <input type="range" class="slider" id="speed" min="0" max="255" value="255" onchange="try{fetch(document.location.origin+'/control?var=speed&val='+this.value);}catch(e){}">
+    </div>
+
+    <br/>
+    <div align=center>
+     <button class="button" id="tiltup" onclick="fetch(document.location.origin+'/control?var=pantilt&val=1');" >Tilt Up</button>
+    </div>
+    <div align=center>
+     <button class="button" id="panleft" onclick="fetch(document.location.origin+'/control?var=pantilt&val=2');" >Pan Left</button>
+    <button class="button" id="panright" onclick="fetch(document.location.origin+'/control?var=pantilt&val=3');" >Pan Right</button>
+    </div>
+
+     <div align=center>
+     <button class="button" id="tiltdown" onclick="fetch(document.location.origin+'/control?var=pantilt&val=4');" >Tilt Down</button>
+    </div>
+
+     <script>
+        window.onload = document.getElementById("camstream").src = window.location.href.slice(0, -1) + ":81/stream";
+    </script><br>
+ <div style="text-align: center;">
+   <button onclick="showSection('home')" style="background-color: lightyellow;">Back to Home</button></div>
+        </section>
+
+        <!-- Section 2 - Sensor Values -->
+        <section id="section2">
+         <br> <br> <br> <br><br><br>
+        <div align=center  >
+ <div style="width: 250px; height: 250px; background-color: lightgreen; border: 2px solid black; border-radius: 15px; padding: 20px;">
+            <h2>Sensor Data</h3> <br>
+            <p><h3><strong>Temperature:</strong> <span id="temperature">37.6</span> °C</p>
+            <p><h3><strong>Humidity:</strong> <span id="humidity">89</span> %</p>
+            <p><h3><strong>MQ2 Gas:</strong> <span id="mq2">258</span> ppm</p>
+            <p><h3><strong>Sound Level:</strong> <span id="sound">32 dB</span></p>
+</div>
+         </div>
+         <script>
+            // Fetch sensor data every 2 seconds
+            setInterval(function() {
+                fetch('/sensor_data').then(function(response) {
+                    return response.json();
+                }).then(function(data) {
+                    document.getElementById('temperature').innerText = data.temperature;
+                    document.getElementById('humidity').innerText = data.humidity;
+                    document.getElementById('mq2').innerText = data.mq2;
+                    document.getElementById('sound').innerText = data.sound;
+                }).catch(function(e){
+                  // handle read errors gracefully
+                });
+            }, 2000);
+
+             window.onload = document.getElementById("camstream").src = window.location.href.slice(0, -1) + ":81/stream";
+        </script>
+    <br>
+ <div style="text-align: center;">
+         <button onclick="showSection('home')" style="background-color: lightyellow;">Back to Home</button></div>
+       </section>
+    </div>
+
+    <script>
+        // Login Validation
+        function validateLogin(event) {
+            event.preventDefault();
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            if (username === "summer" && password === "password123") {
+                document.getElementById('login-page').style.display = 'none';
+                document.getElementById('main-content').style.display = 'block';
+            } else {
+                alert("Incorrect username or password");
+            }
+        }
+
+        // Show specific section
+        function showSection(sectionId) {
+            document.querySelectorAll('section, #home').forEach(section => {
+                section.classList.remove('active');
+            });
+            document.getElementById(sectionId).classList.add('active');
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t index_handler(httpd_req_t *req){
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, (const char *)INDEX_HTML, strlen(INDEX_HTML));
+}
+
+void startCameraServer() {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    httpd_uri_t index_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = index_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t status_uri = {
+        .uri       = "/status",
+        .method    = HTTP_GET,
+        .handler   = status_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t cmd_uri = {
+        .uri       = "/control",
+        .method    = HTTP_GET,
+        .handler   = cmd_handler,
+        .user_ctx  = NULL
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri       = "/stream",
+        .method    = HTTP_GET,
+        .handler   = stream_handler,
+        .user_ctx  = NULL
+    };
+
+    // Register new sensor_data endpoint
+    httpd_uri_t sensor_uri = {
+        .uri       = "/sensor_data",
+        .method    = HTTP_GET,
+        .handler   = sensor_data_handler,
+        .user_ctx  = NULL
+    };
+
+    Serial.printf("Starting web server on port: '%d'\n", config.server_port);
+    if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(camera_httpd, &index_uri);
+        httpd_register_uri_handler(camera_httpd, &cmd_uri);
+        httpd_register_uri_handler(camera_httpd, &status_uri);
+        httpd_register_uri_handler(camera_httpd, &sensor_uri); // <-- register sensor endpoint
+    }
+
+    config.server_port += 1;
+    config.ctrl_port += 1;
+    Serial.printf("Starting stream server on port: '%d'\n", config.server_port);
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &stream_uri);
+    }
+}
+
+void initMotors() {
+  /* Configuring PWM channels for DC motors */
+  ledcSetup(4, 2000, 8);
+  ledcSetup(5, 2000, 8);
+  ledcSetup(6, 2000, 8);
+  ledcSetup(7, 2000, 8);
+
+  ledcAttachPin(RMotor1, 4);
+  ledcAttachPin(RMotor2, 5);
+  ledcAttachPin(LMotor1, 6);
+  ledcAttachPin(LMotor2, 7);
+}
+
+void initServo() {
+  ledcSetup(8, 50, 16);
+  ledcSetup(9, 50, 16);
+
+  ledcAttachPin(panServo, 8);
+  ledcAttachPin(tiltServo, 9);
+
+  ledcWrite(8, panVal);
+  ledcWrite(9, tiltVal);
+}
+
+void initFlash() {
+  ledcSetup(3, 5000, 8);
+  ledcAttachPin(FlashPin, 3);
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+
+  initMotors();
+  initServo();
+  initFlash();
+  Serial.println();
+
+  // Initialize sensor pins
+  pinMode(SOUND_DIGITAL, INPUT);
+  // MQ2 uses analogRead; no pinMode required for ADC
+  dht.begin();
+
+  // (Optional) tune ADC resolution/attenuation if needed
+  // analogSetPinAttenuation(MQ2_PIN, ADC_11db); // uncomment if using core-variants that support it
+  analogReadResolution(12); // 12-bit (0-4095)
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_QVGA);
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+
+  /* Connecting to WiFi */
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+
+  startCameraServer();
+
+  Serial.print("Camera Ready! Use 'http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("' to connect");
+
+  for (int i = 0; i < 5; i++) {
+    ledcWrite(3, 10);
+    delay(50);
+    ledcWrite(3, 0);
+    delay(50);
+  }
+}
+
+void loop() {
+  // Nothing required here, server and interval fetch handle sensor updates.
+}
